@@ -316,6 +316,27 @@ class A2CBase(BaseAlgorithm):
         # soft augmentation not yet supported
         assert not self.has_soft_aug
 
+        # ========== Testing Iterative Ensemble Training ========== #
+        self.enable_ensemble = self.config.get('enable_ensemble', False)
+        if self.enable_ensemble:
+            from isaacgymenvs.tasks.dextreme.allegro_hand_dextreme_finetuning import AdversarialActionAndObservationNoiseGeneratorPlugin
+            ensemble_dir = self.config['ensemble_dir']
+
+            self.ensemble_dir = os.path.join(ensemble_dir, self.experiment_name[:-8])
+            print("Looking for ensemble models in", self.ensemble_dir)
+            os.makedirs(self.ensemble_dir, exist_ok=True)
+
+            self.ensemble_models = []
+            for model in os.scandir(self.ensemble_dir):
+                model_path = os.path.join(self.ensemble_dir, model)
+                print("\tensemble_checkpoint: ", model_path)
+                
+                onnx_model = AdversarialActionAndObservationNoiseGeneratorPlugin(model_path, self.device)
+                self.ensemble_models.append(onnx_model)
+
+            self.num_ensemble_models = len(self.ensemble_models)
+            print("\tnum_ensemble_models: ", self.num_ensemble_models)
+
     def trancate_gradients_and_step(self):
         if self.multi_gpu:
             # batch allreduce ops: see https://github.com/entity-neural-network/incubator/pull/220
@@ -352,7 +373,7 @@ class A2CBase(BaseAlgorithm):
             network = builder.load(params['config']['central_value_config'])
             self.config['central_value_config']['network'] = network
 
-    def write_stats(self, total_time, epoch_num, step_time, play_time, update_time, a_losses, c_losses, entropies, kls, last_lr, lr_mul, frame, scaled_time, scaled_play_time, curr_frames):
+    def write_stats(self, total_time, epoch_num, step_time, play_time, update_time, a_losses, c_losses, entropies, kls, last_lr, lr_mul, frame, scaled_time, scaled_play_time, curr_frames, ensemble_kls=None):
         # do we need scaled time?
         self.diagnostics.send_info(self.writer)
         self.writer.add_scalar('performance/step_inference_rl_update_fps', curr_frames / scaled_time, frame)
@@ -363,6 +384,8 @@ class A2CBase(BaseAlgorithm):
         self.writer.add_scalar('performance/step_time', step_time, frame)
         self.writer.add_scalar('losses/a_loss', torch_ext.mean_list(a_losses).item(), frame)
         self.writer.add_scalar('losses/c_loss', torch_ext.mean_list(c_losses).item(), frame)
+        if self.enable_ensemble:
+            self.writer.add_scalar('losses/ensemble_kl', torch_ext.mean_list(ensemble_kls).item(), frame)
 
         self.writer.add_scalar('losses/entropy', torch_ext.mean_list(entropies).item(), frame)
         self.writer.add_scalar('info/last_lr', last_lr * lr_mul, frame)
@@ -457,6 +480,10 @@ class A2CBase(BaseAlgorithm):
             'use_action_masks' : self.use_action_masks
         }
         self.experience_buffer = ExperienceBuffer(self.env_info, algo_info, self.ppo_device)
+        if self.enable_ensemble:
+            for i in range(self.num_ensemble_models):
+                self.experience_buffer._init_from_aux_dict({"ensemble_sigmas_" + str(i): self.experience_buffer.actions_shape,
+                                                            "ensemble_mus_" + str(i): self.experience_buffer.actions_shape})
 
         val_shape = (self.horizon_length, batch_size, self.value_size)
         current_rewards_shape = (batch_size, self.value_size)
@@ -517,6 +544,7 @@ class A2CBase(BaseAlgorithm):
     def env_step(self, actions):
         actions = self.preprocess_actions(actions)
         obs, rewards, dones, infos = self.vec_env.step(actions)
+        self.obs_dict = obs
 
         if self.is_tensor_obses:
             if self.value_size == 1:
@@ -529,6 +557,7 @@ class A2CBase(BaseAlgorithm):
 
     def env_reset(self):
         obs = self.vec_env.reset()
+        self.obs_dict = obs
         obs = self.obs_to_tensors(obs)
         return obs
 
@@ -816,6 +845,15 @@ class A2CBase(BaseAlgorithm):
             self.experience_buffer.update_data('obses', n, self.obs['obs'])
             self.experience_buffer.update_data('dones', n, self.dones.byte())
 
+            if self.enable_ensemble:
+                for i in range(self.num_ensemble_models):
+                    _, _, ensemble_res_dict = self.ensemble_models[i].get_noise(self.obs_dict, False)
+                    ensemble_mus_i = torch.from_numpy(ensemble_res_dict["mus"]).to(self.device).detach()
+                    ensemble_sigmas_i = torch.from_numpy(ensemble_res_dict["sigmas"]).to(self.device).detach()
+
+                    self.experience_buffer.update_data("ensemble_sigmas_" + str(i), n, ensemble_sigmas_i)
+                    self.experience_buffer.update_data("ensemble_mus_" + str(i), n, ensemble_mus_i)
+
             for k in update_list:
                 self.experience_buffer.update_data(k, n, res_dict[k])
             if self.has_central_value:
@@ -867,7 +905,12 @@ class A2CBase(BaseAlgorithm):
         mb_rewards = self.experience_buffer.tensor_dict['rewards']
         mb_advs = self.discount_values(fdones, last_values, mb_fdones, mb_values, mb_rewards)
         mb_returns = mb_advs + mb_values
-        batch_dict = self.experience_buffer.get_transformed_list(swap_and_flatten01, self.tensor_list)
+
+        tensor_list = self.tensor_list 
+        if self.enable_ensemble:
+            for i in range(self.num_ensemble_models):
+                tensor_list += ["ensemble_mus_" + str(i), "ensemble_sigmas_" + str(i)]
+        batch_dict = self.experience_buffer.get_transformed_list(swap_and_flatten01, tensor_list)
 
         batch_dict['returns'] = swap_and_flatten01(mb_returns)
         batch_dict['played_frames'] = self.batch_size
@@ -1197,11 +1240,17 @@ class ContinuousA2CBase(A2CBase):
         b_losses = []
         entropies = []
         kls = []
+        if self.enable_ensemble:
+            ensemble_kls = []
 
         for mini_ep in range(0, self.mini_epochs_num):
             ep_kls = []
             for i in range(len(self.dataset)):
-                a_loss, c_loss, entropy, kl, last_lr, lr_mul, cmu, csigma, b_loss = self.train_actor_critic(self.dataset[i])
+                if not self.enable_ensemble:
+                    a_loss, c_loss, entropy, kl, last_lr, lr_mul, cmu, csigma, b_loss = self.train_actor_critic(self.dataset[i])
+                else:
+                    a_loss, c_loss, entropy, ensemble_kl_loss, kl, last_lr, lr_mul, cmu, csigma, b_loss = self.train_actor_critic(self.dataset[i])
+                    ensemble_kls.append(ensemble_kl_loss)
                 a_losses.append(a_loss)
                 c_losses.append(c_loss)
                 ep_kls.append(kl)
@@ -1236,7 +1285,11 @@ class ContinuousA2CBase(A2CBase):
         update_time = update_time_end - update_time_start
         total_time = update_time_end - play_time_start
 
-        return batch_dict['step_time'], play_time, update_time, total_time, a_losses, c_losses, b_losses, entropies, kls, last_lr, lr_mul
+        if not self.enable_ensemble:
+            return batch_dict['step_time'], play_time, update_time, total_time, a_losses, c_losses, b_losses, entropies, kls, last_lr, lr_mul
+        else:
+            return batch_dict['step_time'], play_time, update_time, total_time, a_losses, c_losses, b_losses, entropies, ensemble_kls, kls, last_lr, lr_mul
+
 
     def prepare_dataset(self, batch_dict):
         obses = batch_dict['obses']
@@ -1249,6 +1302,13 @@ class ContinuousA2CBase(A2CBase):
         sigmas = batch_dict['sigmas']
         rnn_states = batch_dict.get('rnn_states', None)
         rnn_masks = batch_dict.get('rnn_masks', None)
+
+        if self.enable_ensemble:
+            ensemble_mus = []
+            ensemble_sigmas = []
+            for i in range(self.num_ensemble_models):
+                ensemble_mus.append(batch_dict.get("ensemble_mus_" + str(i), None))
+                ensemble_sigmas.append(batch_dict.get("ensemble_sigmas_" + str(i), None))
 
         advantages = returns - values
 
@@ -1285,6 +1345,10 @@ class ContinuousA2CBase(A2CBase):
         dataset_dict['mu'] = mus
         dataset_dict['sigma'] = sigmas
 
+        if self.enable_ensemble:
+            dataset_dict['ensemble_mus'] = ensemble_mus
+            dataset_dict['ensemble_sigmas'] = ensemble_sigmas
+
         self.dataset.update_values_dict(dataset_dict)
 
         if self.has_central_value:
@@ -1315,7 +1379,11 @@ class ContinuousA2CBase(A2CBase):
 
         while True:
             epoch_num = self.update_epoch()
-            step_time, play_time, update_time, sum_time, a_losses, c_losses, b_losses, entropies, kls, last_lr, lr_mul = self.train_epoch()
+            if not self.enable_ensemble:
+                step_time, play_time, update_time, sum_time, a_losses, c_losses, b_losses, entropies, kls, last_lr, lr_mul = self.train_epoch()
+            else:
+                step_time, play_time, update_time, sum_time, a_losses, c_losses, b_losses, entropies, ensemble_kls, kls, last_lr, lr_mul = self.train_epoch()
+                
             total_time += sum_time
             frame = self.frame // self.num_agents
 
@@ -1334,9 +1402,14 @@ class ContinuousA2CBase(A2CBase):
                 print_statistics(self.print_stats, curr_frames, step_time, scaled_play_time, scaled_time, 
                                 epoch_num, self.max_epochs, frame, self.max_frames)
 
-                self.write_stats(total_time, epoch_num, step_time, play_time, update_time,
-                                a_losses, c_losses, entropies, kls, last_lr, lr_mul, frame,
-                                scaled_time, scaled_play_time, curr_frames)
+                if not self.enable_ensemble:
+                    self.write_stats(total_time, epoch_num, step_time, play_time, update_time,
+                                    a_losses, c_losses, entropies, kls, last_lr, lr_mul, frame,
+                                    scaled_time, scaled_play_time, curr_frames)
+                else:
+                    self.write_stats(total_time, epoch_num, step_time, play_time, update_time,
+                                    a_losses, c_losses, entropies, kls, last_lr, lr_mul, frame,
+                                    scaled_time, scaled_play_time, curr_frames, ensemble_kls)
 
                 if len(b_losses) > 0:
                     self.writer.add_scalar('losses/bounds_loss', torch_ext.mean_list(b_losses).item(), frame)

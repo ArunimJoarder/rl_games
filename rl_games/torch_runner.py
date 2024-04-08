@@ -143,6 +143,7 @@ class Runner:
         _restore(agent, args)
         _override_sigma(agent, args)
         agent.train()
+        self.agent = agent
 
     def run_play(self, args):
         """Run the inference procedure from the algorithm passed in.
@@ -155,6 +156,7 @@ class Runner:
         player = self.create_player()
         _restore(player, args)
         _override_sigma(player, args)
+        self.player = player
         player.run()
 
     def create_player(self):
