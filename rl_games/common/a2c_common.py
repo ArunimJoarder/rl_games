@@ -1304,11 +1304,11 @@ class ContinuousA2CBase(A2CBase):
         rnn_masks = batch_dict.get('rnn_masks', None)
 
         if self.enable_ensemble:
-            ensemble_mus = []
-            ensemble_sigmas = []
+            ensemble_mus = {}
+            ensemble_sigmas = {}
             for i in range(self.num_ensemble_models):
-                ensemble_mus.append(batch_dict.get("ensemble_mus_" + str(i), None))
-                ensemble_sigmas.append(batch_dict.get("ensemble_sigmas_" + str(i), None))
+                ensemble_mus[i] = (batch_dict.get("ensemble_mus_" + str(i), None))
+                ensemble_sigmas[i] = (batch_dict.get("ensemble_sigmas_" + str(i), None))
 
         advantages = returns - values
 

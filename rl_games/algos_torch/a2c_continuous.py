@@ -151,7 +151,6 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
             if self.enable_ensemble:
                 ensemble_kl_loss = torch.zeros_like(c_loss)
                 for i in range(self.num_ensemble_models):
-                    # print("ensemble_mus_i: ", ensemble_mus[i].shape, "\nensemble_sigmas_i: ", ensemble_sigmas[i].shape)
                     ensemble_kl_i = torch_ext.policy_kl(mu, sigma, ensemble_mus[i], ensemble_sigmas[i])
                     ensemble_kl_loss += ensemble_kl_i / self.num_ensemble_models
 
