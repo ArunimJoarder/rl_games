@@ -164,7 +164,7 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
 
             if self.enable_ensemble:
                 # TODO: Maybe a scheduler for e_kl_loss coefficient
-                loss += -1.0 * 0.01 * ensemble_kl_loss
+                loss += -1.0 * 1e-15 * ensemble_kl_loss
 
             if self.multi_gpu:
                 self.optimizer.zero_grad()
